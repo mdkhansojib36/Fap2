@@ -6,8 +6,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://faphouse2.com"
-EMAIL    = os.environ.get("EMAIL", "ENTER_YOUR_EMAIL")
-PASSWORD = os.environ.get("PASSWORD", "ENTER_YOUR_PASSWORD")
+EMAIL    = os.environ.get("EMAIL", "mdkhansojib36@gmail.com")
+PASSWORD = os.environ.get("PASSWORD", "sojibkhusi12*#12")
 
 # ══════════════════════════════════════════════
 # CORE CLIENT
