@@ -1,127 +1,62 @@
 from flask import Flask, jsonify, request, render_template_string
-import os, logging, asyncio
-from playwright.async_api import async_playwright
+import os, logging, subprocess, json
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://faphouse2.com"
 EMAIL    = os.environ.get("EMAIL", "")
 PASSWORD = os.environ.get("PASSWORD", "")
 
-_m3u8_cache: dict[str, str] = {}
+_cache: dict[str, str] = {}
 
-async def _grab_m3u8(video_url: str) -> str | None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ]
+def get_m3u8(video_url: str) -> str | None:
+    if video_url in _cache:
+        return _cache[video_url]
+
+    cmd = [
+        "yt-dlp",
+        "--no-warnings",
+        "--quiet",
+        "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "--get-url",
+        video_url
+    ]
+
+    if EMAIL and PASSWORD:
+        cmd += ["--username", EMAIL, "--password", PASSWORD]
+
+    try:
+        logger.info(f"yt-dlp → {video_url[:60]}")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60
         )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 720},
-        )
+        logger.info(f"yt-dlp exit: {result.returncode}")
+        if result.returncode == 0:
+            lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+            if lines:
+                # m3u8 prefer
+                for line in lines:
+                    if ".m3u8" in line:
+                        _cache[video_url] = line
+                        logger.info(f"✅ M3U8: {line[:70]}")
+                        return line
+                # fallback to first URL
+                url = lines[0]
+                _cache[video_url] = url
+                logger.info(f"✅ URL: {url[:70]}")
+                return url
+        else:
+            logger.error(f"yt-dlp stderr: {result.stderr[:300]}")
+    except subprocess.TimeoutExpired:
+        logger.error("yt-dlp timeout")
+    except Exception as e:
+        logger.error(f"yt-dlp error: {e}")
 
-        m3u8_found: list[str] = []
-
-        # ── intercept every request ──────────────
-        async def handle_request(route):
-            url = route.request.url
-            if ".m3u8" in url:
-                low = url.lower()
-                if not any(x in low for x in ("trailer","preview","sample","teaser")):
-                    logger.info(f"🎯 M3U8 intercepted: {url[:80]}")
-                    m3u8_found.append(url)
-            await route.continue_()
-
-        page = await context.new_page()
-        await page.route("**/*", handle_request)
-
-        # ── login first ──────────────────────────
-        if EMAIL:
-            try:
-                logger.info("🔐 Logging in via browser...")
-                await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20000)
-                
-                # click login button
-                login_btn = page.locator("a[href*='login'], button:has-text('Log'), a:has-text('Sign')")
-                if await login_btn.count() > 0:
-                    await login_btn.first.click()
-                    await page.wait_for_timeout(1500)
-
-                # fill email
-                email_field = page.locator("input[type='email'], input[name='login'], input[placeholder*='mail']")
-                if await email_field.count() > 0:
-                    await email_field.first.fill(EMAIL)
-
-                # fill password
-                pass_field = page.locator("input[type='password']")
-                if await pass_field.count() > 0:
-                    await pass_field.first.fill(PASSWORD)
-
-                # submit
-                submit = page.locator("button[type='submit'], button:has-text('Sign in'), button:has-text('Log in')")
-                if await submit.count() > 0:
-                    await submit.first.click()
-                    await page.wait_for_timeout(3000)
-                    logger.info("✅ Login submitted")
-            except Exception as e:
-                logger.warning(f"Login browser err: {e}")
-
-        # ── go to video page ─────────────────────
-        try:
-            logger.info(f"📡 Loading video page: {video_url[:70]}")
-            await page.goto(video_url, wait_until="domcontentloaded", timeout=25000)
-            await page.wait_for_timeout(2000)
-
-            # click play button if present
-            play_btn = page.locator(
-                "button.play, .vjs-big-play-button, [class*='play'], "
-                "button:has-text('Play'), .player-overlay"
-            )
-            if await play_btn.count() > 0:
-                try:
-                    await play_btn.first.click(timeout=3000)
-                    logger.info("▶ Clicked play")
-                except Exception:
-                    pass
-
-            # wait for m3u8 — up to 12 seconds
-            for _ in range(12):
-                if m3u8_found:
-                    break
-                await page.wait_for_timeout(1000)
-
-        except Exception as e:
-            logger.warning(f"Page load err: {e}")
-        finally:
-            await browser.close()
-
-        if not m3u8_found:
-            return None
-
-        # prefer 1080p
-        for u in m3u8_found:
-            if "1080" in u:
-                return u
-        return m3u8_found[0]
-
-
-def get_m3u8_sync(video_url: str) -> str | None:
-    if video_url in _m3u8_cache:
-        return _m3u8_cache[video_url]
-    result = asyncio.run(_grab_m3u8(video_url))
-    if result:
-        _m3u8_cache[video_url] = result
-    return result
+    return None
 
 
 # ══════════════════════════════════════════════
@@ -157,14 +92,18 @@ _HOME = """<!DOCTYPE html>
                   color:var(--muted);pointer-events:none}
   input[type=text]{width:100%;padding:13px 14px 13px 42px;background:rgba(255,255,255,.05);
                    border:1px solid var(--border);border-radius:10px;color:var(--text);
-                   font-size:13px;outline:none;transition:border-color .2s,box-shadow .2s}
+                   font-size:13px;outline:none;transition:border-color .2s,box-shadow .2s;
+                   font-family:'Inter',monospace}
   input[type=text]::placeholder{color:var(--muted)}
   input[type=text]:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,92,252,.15)}
   button{width:100%;padding:13px;background:linear-gradient(135deg,var(--accent),#6d4fe8);
          border:none;border-radius:10px;color:#fff;font-size:14px;font-weight:700;cursor:pointer;
          transition:transform .15s,box-shadow .15s;box-shadow:0 4px 15px rgba(124,92,252,.35)}
   button:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(124,92,252,.5)}
+  button:active{transform:translateY(0)}
   .hint{color:var(--muted);font-size:11px;margin-top:10px;text-align:center}
+  .warn{background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.2);
+        border-radius:8px;padding:10px 14px;font-size:11px;color:#fbbf24;margin-bottom:16px;line-height:1.5}
   hr{border:none;border-top:1px solid var(--border);margin:28px 0}
   .api-title{color:var(--muted);font-size:10px;font-weight:600;letter-spacing:.1em;
              text-transform:uppercase;margin-bottom:12px}
@@ -175,16 +114,14 @@ _HOME = """<!DOCTYPE html>
           background:rgba(52,211,153,.15);color:var(--green);letter-spacing:.05em;flex-shrink:0}
   .footer{margin-top:24px;text-align:center;font-size:10px;color:var(--muted)}
   .footer span{color:var(--accent2)}
-  .warn{background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.2);
-        border-radius:8px;padding:10px 14px;font-size:11px;color:#fbbf24;margin-bottom:16px}
 </style></head><body>
 <div class="card">
   <div class="brand">
     <div class="logo">🎬</div>
-    <div class="brand-text"><h1>FapPlayer</h1><span>Headless browser extractor</span></div>
+    <div class="brand-text"><h1>FapPlayer</h1><span>yt-dlp powered extractor</span></div>
   </div>
   <div class="dev-tag">⚡ by Ariyan Sefat</div>
-  <div class="warn">⏳ First load takes ~15 seconds — browser launching</div>
+  <div class="warn">⏳ প্রথম request এ ~20 সেকেন্ড লাগতে পারে — yt-dlp processing করছে</div>
   <form method="GET" action="/play">
     <div class="input-wrap">
       <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
@@ -195,7 +132,7 @@ _HOME = """<!DOCTYPE html>
     </div>
     <button type="submit">▶  Watch Now</button>
   </form>
-  <p class="hint">Playwright headless Chromium — JS rendered, full video</p>
+  <p class="hint">EMAIL + PASSWORD env vars set থাকলে premium video চলবে</p>
   <hr>
   <p class="api-title">API</p>
   <div class="endpoints">
@@ -226,7 +163,8 @@ _PLAYER = """<!DOCTYPE html>
        box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
   a.back-btn{color:var(--muted);text-decoration:none;font-size:12px;padding:6px 12px;
-             background:var(--glass);border:1px solid var(--border);border-radius:8px}
+             background:var(--glass);border:1px solid var(--border);border-radius:8px;
+             transition:color .2s,border-color .2s}
   a.back-btn:hover{color:var(--text);border-color:var(--accent)}
   .player-wrap{width:100%;max-width:1100px;aspect-ratio:16/9;background:#000;
                border-radius:16px;overflow:hidden;border:1px solid var(--border);
@@ -257,39 +195,46 @@ _PLAYER = """<!DOCTYPE html>
   </video>
 </div>
 <div style="width:100%;max-width:1100px">
-  <span class="badge">⚡ 1080p • HLS</span>
+  <span class="badge">⚡ Best Quality • yt-dlp</span>
 </div>
 <div class="meta-bar">
-  <div class="meta-url"><a href="{{ m3u8_url }}" target="_blank">{{ m3u8_url[:130] }}</a></div>
+  <div class="meta-url">
+    <a href="{{ m3u8_url }}" target="_blank">{{ m3u8_url[:130] }}</a>
+  </div>
 </div>
 <p class="footer">Built with 💜 by <span>Ariyan Sefat</span></p>
 <script src="https://vjs.zencdn.net/8.6.1/video.min.js"></script>
 <script>
-var p = videojs('player',{
-  techOrder:['html5'],
-  html5:{hls:{overrideNative:true,enableLowInitialPlaylist:false,smoothQualityChange:true}},
-  playbackRates:[0.5,0.75,1,1.25,1.5,2],responsive:true,fluid:true
+var p = videojs('player', {
+  techOrder: ['html5'],
+  html5: { hls: { overrideNative: true, enableLowInitialPlaylist: false } },
+  playbackRates: [0.5, 0.75, 1, 1.25, 1.5, 2],
+  responsive: true, fluid: true
 });
-p.ready(function(){
-  this.on('loadedmetadata',function(){
-    var q=this.qualityLevels?this.qualityLevels():null;
-    if(q&&q.length){
-      var best=-1,bestH=0;
-      for(var i=0;i<q.length;i++){if(q[i].height>bestH){bestH=q[i].height;best=i;}}
-      for(var j=0;j<q.length;j++){q[j].enabled=(j===best);}
+p.ready(function() {
+  this.on('loadedmetadata', function() {
+    var q = this.qualityLevels ? this.qualityLevels() : null;
+    if (q && q.length) {
+      var best = -1, bestH = 0;
+      for (var i = 0; i < q.length; i++) {
+        if (q[i].height > bestH) { bestH = q[i].height; best = i; }
+      }
+      for (var j = 0; j < q.length; j++) { q[j].enabled = (j === best); }
     }
   });
-  this.play().catch(function(){});
+  this.play().catch(function() {});
 });
 </script></body></html>"""
 
 _ERR = """<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:#080b10;color:#e2e8f0;display:flex;align-items:center;
-       justify-content:center;min-height:100vh;font-family:system-ui}
+       justify-content:center;min-height:100vh;font-family:system-ui;
+       background-image:radial-gradient(ellipse at 50% 30%,rgba(248,113,113,.08) 0%,transparent 60%)}
   .b{text-align:center;max-width:480px;padding:20px}
   .icon{font-size:48px;margin-bottom:16px}
-  h2{color:#f87171;margin-bottom:10px}p{color:#4a5568;margin-bottom:24px;font-size:13px}
+  h2{color:#f87171;margin-bottom:10px}
+  p{color:#4a5568;margin-bottom:24px;font-size:13px;line-height:1.6}
   a{color:#e2e8f0;padding:10px 24px;background:rgba(255,255,255,.05);
     border:1px solid rgba(255,255,255,.08);border-radius:8px;text-decoration:none;font-size:13px}
   a:hover{border-color:#7c5cfc}
@@ -302,6 +247,7 @@ _ERR = """<!DOCTYPE html><html><head><meta charset="UTF-8"><style>
 def err(t, m, code=500):
     return render_template_string(_ERR, t=t, m=m), code
 
+
 # ══════════════════════════════════════════════
 # ROUTES
 # ══════════════════════════════════════════════
@@ -313,10 +259,11 @@ def index():
 def play():
     url = request.args.get("url", "").strip().split("#")[0]
     if not url:
-        return err("No URL", "Pass ?url=VIDEO_URL", 400)
-    m3u8 = get_m3u8_sync(url)
+        return err("No URL", "?url=VIDEO_URL দাও", 400)
+    m3u8 = get_m3u8(url)
     if not m3u8:
-        return err("Stream Not Found", "Playwright টা m3u8 পায়নি — login check কর।", 404)
+        return err("Stream Not Found",
+                   "yt-dlp m3u8 পায়নি। Premium account দরকার হতে পারে।", 404)
     return render_template_string(_PLAYER, m3u8_url=m3u8, video_url=url)
 
 @app.route("/api/m3u8")
@@ -324,7 +271,7 @@ def api_m3u8():
     url = request.args.get("url", "").strip().split("#")[0]
     if not url:
         return jsonify({"error": "Missing url"}), 400
-    m3u8 = get_m3u8_sync(url)
+    m3u8 = get_m3u8(url)
     if m3u8:
         return jsonify({"success": True, "m3u8_url": m3u8})
     return jsonify({"success": False, "error": "Not found"}), 404
@@ -333,11 +280,11 @@ def api_m3u8():
 def api_status():
     return jsonify({
         "status":    "online",
-        "engine":    "playwright-chromium",
-        "cache":     len(_m3u8_cache),
+        "engine":    "yt-dlp",
+        "cache":     len(_cache),
         "developer": "Ariyan Sefat",
     })
 
 if __name__ == "__main__":
-    print("FapPlayer by Ariyan Sefat — Playwright engine — :5000")
+    print("FapPlayer by Ariyan Sefat — yt-dlp engine — :5000")
     app.run(host="0.0.0.0", port=5000, debug=False)
