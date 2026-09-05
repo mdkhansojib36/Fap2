@@ -14,43 +14,47 @@ def get_m3u8(video_url: str) -> str | None:
     if video_url in _cache:
         return _cache[video_url]
 
-    cmd = [
+    # yt-dlp দিয়ে সব format list করো
+    cmd_list = [
         "yt-dlp",
         "--no-warnings",
         "--quiet",
-        "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-        "--get-url",
+        "-J",  # full JSON output
         video_url
     ]
-
     if EMAIL and PASSWORD:
-        cmd += ["--username", EMAIL, "--password", PASSWORD]
+        cmd_list += ["--username", EMAIL, "--password", PASSWORD]
 
     try:
-        logger.info(f"yt-dlp → {video_url[:60]}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        logger.info(f"yt-dlp exit: {result.returncode}")
+        logger.info(f"yt-dlp JSON → {video_url[:60]}")
+        result = subprocess.run(cmd_list, capture_output=True, text=True, timeout=60)
+
         if result.returncode == 0:
-            lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
-            if lines:
-                # m3u8 prefer
-                for line in lines:
-                    if ".m3u8" in line:
-                        _cache[video_url] = line
-                        logger.info(f"✅ M3U8: {line[:70]}")
-                        return line
-                # fallback to first URL
-                url = lines[0]
-                _cache[video_url] = url
-                logger.info(f"✅ URL: {url[:70]}")
-                return url
-        else:
-            logger.error(f"yt-dlp stderr: {result.stderr[:300]}")
+            data = json.loads(result.stdout)
+            formats = data.get("formats", [])
+
+            best_url  = None
+            best_h    = 0
+
+            for fmt in formats:
+                url = fmt.get("url", "")
+                h   = fmt.get("height") or 0
+
+                # trailer/preview skip
+                low = url.lower()
+                if any(x in low for x in ("trailer", "preview", "sample", "teaser")):
+                    logger.info(f"⏭ Skipping trailer: {url[:60]}")
+                    continue
+
+                if h > best_h:
+                    best_h   = h
+                    best_url = url
+
+            if best_url:
+                logger.info(f"✅ Full video {best_h}p: {best_url[:70]}")
+                _cache[video_url] = best_url
+                return best_url
+
     except subprocess.TimeoutExpired:
         logger.error("yt-dlp timeout")
     except Exception as e:
