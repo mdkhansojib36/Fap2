@@ -1,1 +1,1 @@
-web: gunicorn FapPlayer:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+web: playwright install chromium && gunicorn app:app --timeout 120 --workers 1
